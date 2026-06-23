@@ -12,7 +12,7 @@ import json
 import os
 import re
 import sys
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from pathlib import Path
 
 TEXT_EXTS = {
@@ -89,6 +89,22 @@ WEIGHTS = {
     "api":          1.0,
 }
 
+_BOLD_YELLOW = "\033[1;33m"
+_RESET       = "\033[0m"
+
+
+def _hl(text: str, start: int, end: int, color: bool) -> str:
+    if not color or start >= end:
+        return text
+    return text[:start] + _BOLD_YELLOW + text[start:end] + _RESET + text[end:]
+
+
+@dataclass
+class Sample:
+    text: str
+    hl_start: int   # match offset within text
+    hl_end: int
+
 
 @dataclass
 class Finding:
@@ -97,13 +113,22 @@ class Finding:
     score: float
     label: str
     signals: dict[str, int] = field(default_factory=dict)
-    samples: list[str] = field(default_factory=list)
+    samples: list[Sample] = field(default_factory=list)
+
+    def to_json_dict(self) -> dict:
+        return {
+            "path": self.path,
+            "size": self.size,
+            "score": self.score,
+            "label": self.label,
+            "signals": self.signals,
+            "samples": [s.text for s in self.samples],
+        }
 
 
 def looks_binary(blob: bytes) -> bool:
     if b"\x00" in blob[:4096]:
         return True
-    # Heuristic: many non-text bytes in first 4 KiB
     sample = blob[:4096]
     if not sample:
         return False
@@ -111,27 +136,33 @@ def looks_binary(blob: bytes) -> bool:
     return text_bytes / len(sample) < 0.85
 
 
-def count_hits(text: str, patterns: list[re.Pattern]) -> tuple[int, list[str]]:
+def count_hits(text: str, patterns: list[re.Pattern]) -> tuple[int, list[Sample]]:
     hits = 0
-    samples: list[str] = []
+    samples: list[Sample] = []
     for pat in patterns:
         for m in pat.finditer(text):
             hits += 1
             if len(samples) < 2:
-                start = max(0, m.start() - 20)
-                end = min(len(text), m.end() + 20)
-                snippet = text[start:end].replace("\n", " ").strip()
+                ctx_start = max(0, m.start() - 20)
+                ctx_end   = min(len(text), m.end() + 20)
+                raw       = text[ctx_start:ctx_end]
+                replaced  = raw.replace("\n", " ")
+                leading   = len(replaced) - len(replaced.lstrip())
+                snippet   = replaced.strip()
+                hl_start  = max(0, m.start() - ctx_start - leading)
+                hl_end    = hl_start + (m.end() - m.start())
                 if len(snippet) > 120:
-                    snippet = snippet[:117] + "..."
-                samples.append(snippet)
-            if hits >= 50:  # cap per pattern group
+                    snippet  = snippet[:117] + "..."
+                    hl_end   = min(hl_end, 117)
+                samples.append(Sample(text=snippet, hl_start=hl_start, hl_end=hl_end))
+            if hits >= 50:
                 return hits, samples
     return hits, samples
 
 
-def score_text(text: str) -> tuple[float, dict[str, int], list[str]]:
+def score_text(text: str) -> tuple[float, dict[str, int], list[Sample]]:
     signals: dict[str, int] = {}
-    samples: list[str] = []
+    samples: list[Sample] = []
     score = 0.0
     for name, patterns in (
         ("role", ROLE_PATTERNS),
@@ -144,7 +175,7 @@ def score_text(text: str) -> tuple[float, dict[str, int], list[str]]:
         hits, snip = count_hits(text, patterns)
         if hits:
             signals[name] = hits
-            score += WEIGHTS[name] * (1 + 0.3 * (hits - 1))  # diminishing returns
+            score += WEIGHTS[name] * (1 + 0.3 * (hits - 1))
             samples.extend(snip[:1])
     return round(score, 2), signals, samples[:4]
 
@@ -166,9 +197,8 @@ def iter_files(root: Path, all_files: bool):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
         for name in filenames:
             p = Path(dirpath) / name
-            if not all_files:
-                if p.suffix.lower() not in TEXT_EXTS:
-                    continue
+            if not all_files and p.suffix.lower() not in TEXT_EXTS:
+                continue
             yield p
 
 
@@ -203,7 +233,7 @@ def scan_file(path: Path) -> Finding | None:
     )
 
 
-def format_human(findings: list[Finding], threshold: float) -> str:
+def format_human(findings: list[Finding], threshold: float, color: bool) -> str:
     if not findings:
         return "no prompt-like content detected"
     lines = []
@@ -214,7 +244,7 @@ def format_human(findings: list[Finding], threshold: float) -> str:
         lines.append(f"{f.score:>6.2f}  {f.label:<24}  {f.path}")
         lines.append(f"        signals: {sig}")
         for s in f.samples:
-            lines.append(f"        ~ {s}")
+            lines.append(f"        ~ {_hl(s.text, s.hl_start, s.hl_end, color)}")
     return "\n".join(lines) if lines else f"no findings at score >= {threshold}"
 
 
@@ -228,7 +258,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--threshold", type=float, default=1.0, help="Minimum score to report (default: 1.0)")
     ap.add_argument("--all-files", action="store_true", help="Scan all files, not just known text extensions")
     ap.add_argument("--top", type=int, default=0, help="Only show top-N findings by score (0 = all)")
+    ap.add_argument("--no-color", action="store_true", help="Disable ANSI match highlighting")
     args = ap.parse_args(argv)
+
+    color = not args.no_color and sys.stdout.isatty()
 
     root = Path(args.path).resolve()
     if not root.exists():
@@ -252,9 +285,9 @@ def main(argv: list[str] | None = None) -> int:
         findings = findings[: args.top]
 
     if args.json:
-        print(json.dumps([asdict(f) for f in findings], indent=2))
+        print(json.dumps([f.to_json_dict() for f in findings], indent=2))
     else:
-        print(format_human(findings, args.threshold))
+        print(format_human(findings, args.threshold, color))
 
     return 0 if findings else 1
 
